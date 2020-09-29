@@ -1,14 +1,17 @@
 FROM node:12-alpine
 
-RUN apk update; apk add tzdata
-
+RUN apk add tzdata
 RUN ln -sf /usr/share/zoneinfo/Asia/Jakarta /etc/localtime
 
+# create app directory
 WORKDIR /app
-COPY package.json .
-RUN npm install
+
+COPY package.json ./
+
+RUN npm install --save
+
+# Bundle app source
 COPY . .
 
-ENV NODE_ENV production
-
-ENTRYPOINT [ "node", "index.js"]
+# Run the command on container startup
+ENTRYPOINT ["npm", "start"]
