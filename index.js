@@ -3,14 +3,12 @@ const iniParser = require('./libs/iniParser')
 const logging = require('./libs/logging')
 const util = require('./libs/utils')
 const args = require('minimist')(process.argv.slice(2));
-const bodyParser = require('body-parser')
-const express = require('express')
 const amqp = require('amqplib/callback_api');
 const mongo = require('./libs/mongo')
-const app = express()
 
 const NODE_ENV = process.env.NODE_ENV || 'development'
 process.env.TZ = 'Asia/Jakarta'
+
 // default config if config file is not provided
 let config = {
     log: {
@@ -30,9 +28,6 @@ let configFile = ('production' === NODE_ENV) ? args.c || args.config || './confi
 config = iniParser.init(config, configFile, args)
 config.log.level = args.logLevel || config.log.level
 
-const take_port = config.app.port;
-const port = take_port || process.env.PORT;
-
 // Initialize logging library
 logging.init({
     path: config.log.path,
@@ -51,41 +46,17 @@ mongo.ping( (err, res) => {
 })
 
 logging.info(`[CONFIG] ${JSON.stringify(iniParser.get())}`)
+logging.info(`[APP] TRANSACTION STATUS WORKER STARTED on : ENV : ${NODE_ENV}`)
 
-app.use(bodyParser.urlencoded({extended: true}));
-app.use(bodyParser.json());
-
-app.listen(config.app.port, () => {
-    logging.info(`[APP] TRANSACTION STATUS WORKER STARTED on : ${config.app.port} ENV : ${NODE_ENV}`)
-});
-
-process
-.on('unhandledRejection', (reason, p) => {
-    console.error(reason, 'Unhandled Rejection at Promise', p);
-})
-.on('uncaughtException', err => {
-    console.error(err, 'Uncaught Exception thrown');
-});
-
-// process.setMaxListeners(0);
-
-// const mq = require('./libs/MQServices')
-// function testQue() {
-//     let data = {
-//         "id": "123"
-//     }
-//     mq(config.queue.host, config.queue.queName, data)
-// }
-// testQue()
 config = iniParser.get()
 
-
 main(config.queue.host, config.queue.queName)
+
 const request = require('./libs/needleRequest')
 const pusher = require('./libs/MQServices')
 const db = require('./libs/mongoController')
 
-
+//main function to manage data queue
 function main(queueConn, queueName) {
     amqp.connect(queueConn, function(error0, connection) {
         try {
@@ -114,18 +85,28 @@ function main(queueConn, queueName) {
                     let newData = JSON.parse(data.content.toString())
                     logging.info(`[receiverData] >>>> ${JSON.stringify(newData)}`)
 
-                    if (newData.id) {
+                    if (newData.id) {//if data exist
                         let trx = await getStatusTransaction(newData.trx_id)
                         if (!trx) {
                             logging.info(`[INFO-TRX]  >>>> Transaction is still pending`)
                             sendToQueueTrx(newData)
                         }
 
-                        let result = await updateTrx(newData.id, trx.data)
-                        if (!result) {
+                        let result = await updateTrxStatus(newData.id, trx.data)
+                        if (!result) { //if Something happen with db, we should send back to queue
                             logging.info(`[INFO-TRX]  >>>> Failed while updating data`)
                             sendToQueueTrx(newData)
                         }
+                        // console.log(JSON.stringify(trx.data));
+                        let userInfo = await getUserSaldo(newData.user_id)
+                        let preSaldo = userInfo.saldo - (trx.data.amount + trx.data.fee)
+
+                        let updateSaldo_ = await updateSaldo(userInfo._id, preSaldo)
+                        if (!updateSaldo_) { //if Something happen with db, we should send back to queue
+                            logging.debug(`[INFO-TRX]  >>>> Failed while updating data`)
+                            sendToQueueTrx(newData)
+                        }
+                        logging.debug(`[INFO-TRX]  >>>> Successfully done.`)
                     }else {
                         logging.info(`[INFO-TRX]  >>>> Data not found`)
                     }
@@ -133,7 +114,7 @@ function main(queueConn, queueName) {
                     setTimeout(function() {
                         // logging.info(`[AMQP Msg] >>>> ${JSON.parse(data)}`)
                         channel.ack(data);
-                    }, secs * 3000);
+                    }, secs * 5000);
                 }, {
                     // manual acknowledgment mode,
                     // see https://www.rabbitmq.com/confirms.html for details
@@ -148,10 +129,10 @@ function main(queueConn, queueName) {
     })
 }
 
-
+//get info transaction from main service
 async function getStatusTransaction(id) {
     let result = await request('GET', id, {}, {json:true})
-    logging.info(`[getStatusTransaction] >>>> ${JSON.stringify(result)}`)
+    logging.debug(`[getStatusTransaction] >>>> ${JSON.stringify(result)}`)
     if (!result.status) return false
 
     if (result.data.status !== 'SUCCESS') return false
@@ -159,7 +140,46 @@ async function getStatusTransaction(id) {
     return result
 }
 
-async function updateTrx(id, data) {
+// get Detail transaction
+async function getTransaction(id) {
+    try {
+        let getTrx = await db.findData(config.mongodb.collection_transactions, {_id: id})
+        if (getTrx.length === 0) {
+            return false;
+        }
+
+        return getTrx[0];
+    } catch (e) {
+        throw (false)
+    }
+}
+
+// data get user dan user saldo
+async function getUserSaldo(user_id) {
+    let docs = [
+        {$match: {user_id: require('mongodb').ObjectId(user_id)}},
+        {
+            $lookup: {
+                from: config.mongodb.collection_users,
+                localField: "user_id",
+                foreignField: "_id",
+                as: "user_id"
+            }
+        },
+        {
+            $unwind: '$user_id'
+        }
+    ]
+
+    let result = await db.findAgg(config.mongodb.collection_users_saldo, docs)
+
+    logging.debug(`[userInfo&Saldo] >>>> ${JSON.stringify(result)}`)
+    if (result.length > 0) return result[0];
+    return [];
+}
+
+// update status transaction
+async function updateTrxStatus(id, data) {
     try {
         let dataUpdate = {
             $set :
@@ -168,25 +188,48 @@ async function updateTrx(id, data) {
                 response: data
             }
         }
-        let clause ={
-            _id: id
-        }
+        let clause = {_id: id}
 
         let update = await db.updateData(config.mongodb.collection_transactions, clause, dataUpdate)
-        logging.debug(`[updateTrx]  >>>> ${JSON.stringify(update)}`)
+        logging.debug(`[updateTrxStatus]  >>>> ${JSON.stringify(update)}`)
         if (!update) return false
 
         return true
     } catch (e) {
-        logging.error(`[updateTrx]  >>>> ${JSON.stringify(e.stack)}`)
+        logging.error(`[updateTrxStatus]  >>>> ${JSON.stringify(e.stack)}`)
         throw (false)
     }
 }
 
+//update balance user
+async function updateSaldo(id, saldo) {
+    try {
+        let dataUpdate = {
+            $set :
+            {
+                updated_at: util.formatDateStandard(new Date(), true),
+                saldo: saldo
+            }
+        }
+        let clause = {_id: require('mongodb').ObjectId(id)}
+
+        let update = await db.updateData(config.mongodb.collection_users_saldo, clause, dataUpdate)
+        logging.debug(`[updateSaldo]  >>>> ${JSON.stringify(update)}`)
+        if (!update) return false
+
+        return true
+    } catch (e) {
+        logging.error(`[updateSaldo]  >>>> ${JSON.stringify(e.stack)}`)
+        throw (false)
+    }
+}
+
+//send back again data into queue
 function sendToQueueTrx(data) {
     let dataQueueTrx = {
         id: data.id,
-        trx_id: data.trx_id
+        trx_id: data.trx_id,
+        user_id: data.user_id
     }
     pusher(config.queue.host, config.queue.queName, dataQueueTrx)
 }

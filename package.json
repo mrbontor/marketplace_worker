@@ -4,7 +4,8 @@
   "description": "marketplace worker service",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "SET NODE_ENV=development & node index.js"
   },
   "keywords": [
     "rabbitmq",
