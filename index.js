@@ -90,23 +90,26 @@ function main(queueConn, queueName) {
                         if (!trx) {
                             logging.info(`[INFO-TRX]  >>>> Transaction is still pending`)
                             sendToQueueTrx(newData)
+                        }else {
+                            console.log(JSON.stringify(trx));
+                            let result = await updateTrxStatusFlip(newData.id, trx)
+                            if (result) { //if Something happen with db, we should send back to queue
+                                // logging.info(`[INFO-TRX]  >>>> Failed while updating data`)
+                                // sendToQueueTrx(newData)
+                                let userInfo = await getUserSaldo(newData.user_id)
+                                let preSaldo = userInfo.saldo - (trx.amount + trx.fee)
+
+                                let updateSaldo_ = await updateSaldo(userInfo._id, preSaldo)
+                                if (!updateSaldo_) { //if Something happen with db, we should send back to queue
+                                    logging.debug(`[INFO-TRX]  >>>> Failed while updating data`)
+                                    sendToQueueTrx(newData)
+                                }
+                                logging.debug(`[INFO-TRX]  >>>> Successfully done.`)
+                                let total = trx.amount +
+                                await updateTrxDetail(newData.id, trx)
+                            }
                         }
 
-                        let result = await updateTrxStatus(newData.id, trx.data)
-                        if (!result) { //if Something happen with db, we should send back to queue
-                            logging.info(`[INFO-TRX]  >>>> Failed while updating data`)
-                            sendToQueueTrx(newData)
-                        }
-                        // console.log(JSON.stringify(trx.data));
-                        let userInfo = await getUserSaldo(newData.user_id)
-                        let preSaldo = userInfo.saldo - (trx.data.amount + trx.data.fee)
-
-                        let updateSaldo_ = await updateSaldo(userInfo._id, preSaldo)
-                        if (!updateSaldo_) { //if Something happen with db, we should send back to queue
-                            logging.debug(`[INFO-TRX]  >>>> Failed while updating data`)
-                            sendToQueueTrx(newData)
-                        }
-                        logging.debug(`[INFO-TRX]  >>>> Successfully done.`)
                     }else {
                         logging.info(`[INFO-TRX]  >>>> Data not found`)
                     }
@@ -131,19 +134,23 @@ function main(queueConn, queueName) {
 
 //get info transaction from main service
 async function getStatusTransaction(id) {
-    let result = await request('GET', id, {}, {json:true})
-    logging.debug(`[getStatusTransaction] >>>> ${JSON.stringify(result)}`)
-    if (!result.status) return false
-
-    if (result.data.status !== 'SUCCESS') return false
-
-    return result
+    try {
+        let result = await request('GET', id, {}, {json:true})
+        logging.debug(`[getStatusTransaction] >>>> ${JSON.stringify(result)}`)
+        if (!result.status || result.data.status !== 'SUCCESS') {
+            return false
+        }
+        return result.data
+    } catch (e) {
+        logging.error(`[getStatusTransaction] >>>> ${JSON.stringify(e.stack)}`)
+        return false;
+    }
 }
 
 // get Detail transaction
 async function getTransaction(id) {
     try {
-        let getTrx = await db.findData(config.mongodb.collection_transactions, {_id: id})
+        let getTrx = await db.findData(config.mongodb.collection_transactions_flip, {_id: id})
         if (getTrx.length === 0) {
             return false;
         }
@@ -175,11 +182,11 @@ async function getUserSaldo(user_id) {
 
     logging.debug(`[userInfo&Saldo] >>>> ${JSON.stringify(result)}`)
     if (result.length > 0) return result[0];
-    return [];
+    return null;
 }
 
-// update status transaction
-async function updateTrxStatus(id, data) {
+// update status transaction's flip
+async function updateTrxStatusFlip(id, data) {
     try {
         let dataUpdate = {
             $set :
@@ -190,14 +197,38 @@ async function updateTrxStatus(id, data) {
         }
         let clause = {_id: id}
 
-        let update = await db.updateData(config.mongodb.collection_transactions, clause, dataUpdate)
-        logging.debug(`[updateTrxStatus]  >>>> ${JSON.stringify(update)}`)
-        if (!update) return false
-
-        return true
+        let update = await db.updateData(config.mongodb.collection_transactions_flip, clause, dataUpdate)
+        logging.debug(`[updateTrxStatusFlip]  >>>> ${JSON.stringify(update)}`)
+        if (update.result.n >= 1) return true
     } catch (e) {
-        logging.error(`[updateTrxStatus]  >>>> ${JSON.stringify(e.stack)}`)
-        throw (false)
+        logging.error(`[updateTrxStatusFlip]  >>>> ${JSON.stringify(e.stack)}`)
+        return false
+    }
+}
+
+// update status transaction detail
+async function updateTrxDetail(id, data, total) {
+    try {
+        let total = data.fee + data.amount
+        let dataUpdate = {
+            $set :
+            {
+                updated_at: util.formatDateStandard(new Date(), true),
+                response_vendor: data,
+                status: 'SUCCESS',
+                fee: data.fee,
+                total_bill: total,
+                // reff: '', //no needed for now
+            }
+        }
+        let clause = {trx_vendor: id}
+
+        let update = await db.updateData(config.mongodb.collection_transactions, clause, dataUpdate)
+        logging.debug(`[updateTrxDetail]  >>>> ${JSON.stringify(update)}`)
+        if (update.result.n >= 1) return true
+    } catch (e) {
+        logging.error(`[updateTrxDetail]  >>>> ${JSON.stringify(e.stack)}`)
+        return false
     }
 }
 
@@ -215,9 +246,7 @@ async function updateSaldo(id, saldo) {
 
         let update = await db.updateData(config.mongodb.collection_users_saldo, clause, dataUpdate)
         logging.debug(`[updateSaldo]  >>>> ${JSON.stringify(update)}`)
-        if (!update) return false
-
-        return true
+        if (update.result.n >= 1) return true
     } catch (e) {
         logging.error(`[updateSaldo]  >>>> ${JSON.stringify(e.stack)}`)
         throw (false)
